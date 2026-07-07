@@ -2,6 +2,14 @@
 
 Backend REST de la aplicacion **Alumnos**, construido con **Spring Boot 3.5** y **Java 21**. Expone una API para gestion de ep03 con soporte para CRUD, exportacion/importacion CSV y documentacion OpenAPI integrada.
 
+> **Proyecto EFT — ISY1101 Introducción a Herramientas DevOps (Duoc UC)**
+> Este repositorio es uno de los tres componentes del sistema **Gestor de Alumnos**, desplegado en **Amazon EKS**:
+> - 🗄️ Base de datos: [ep03-database](https://github.com/ikevin-p/ep03-database)
+> - ⚙️ Backend (este repo): **ep03-backend**
+> - 🖥️ Frontend: [ep03-frontend](https://github.com/ikevin-p/ep03-frontend)
+>
+> Guía del curso: [ISY1101-003V_EP03 · guia-04](https://github.com/mauriciovelasquezduoc/ISY1101-003V_EP03/tree/main/guia-04)
+
 
 ---
 
@@ -369,214 +377,124 @@ Los escenarios estan en `src/test/resources/features/ep03.feature` y se ejecutan
 
 ## Contexto en la arquitectura
 
-Esta imagen forma parte de la infraestructura de 3 capas del sistema Alumnos:
+Este servicio forma parte de la arquitectura de 3 capas del sistema **Gestor de Alumnos**, desplegada en un clúster **Amazon EKS** (`laboratorio-ep03-eks`), dentro del namespace `ep03`:
 
 ```
-Internet
+Usuario
    |
-EC2-Web   (ep03-frontend:latest)    — Capa Web    — Puerto 80
+AWS ELB (Load Balancer publico)
    |
-EC2-App   (ep03-backend:latest)    — Capa App    — Puerto 8080  <-- este servicio
-   |
-EC2-Datos (ep03-db:latest)  — Capa Datos  — Puerto 5432
+Frontend  (Service: ep03-frontend, LoadBalancer)  — Nginx :80
+   |  proxy interno /ep03 -> backend:8080
+Backend   (Service: ep03-backend, ClusterIP)  — Spring Boot :8080   <-- este servicio
+   |  JDBC
+Database  (Service: ep03-database, ClusterIP) — PostgreSQL :5432
 ```
 
-- Desplegada en `Subnet-App` sin acceso a internet
-- Solo accesible desde la capa Web (SG-App permite TCP 8080 unicamente desde SG-Web)
-- Accede a PostgreSQL en `Subnet-Datos` por IP privada
-- Acceso a ECR, SSM, CloudWatch Logs y STS por VPC Endpoints privados
-- IPs resueltas en tiempo de despliegue desde SSM Parameter Store
+- El backend se despliega como `Deployment` de Kubernetes (`ep03-backend`), con `strategy: Recreate` para evitar que convivan dos versiones del API contra el mismo esquema durante un rollout.
+- Autoescalado horizontal vía `HorizontalPodAutoscaler`: 1 a 10 réplicas, activado sobre 70% de uso de CPU.
+- Expuesto internamente solo vía `Service` tipo `ClusterIP` (`ep03-backend:8080`) — no tiene IP pública ni es alcanzable directamente desde internet; únicamente el frontend puede resolverlo por DNS interno del clúster.
+- Se conecta a PostgreSQL vía el `Service` interno `ep03-database:5432`.
+- Nodos worker gestionados por un Node Group EC2 dentro del clúster EKS, con el rol IAM `LabEksNodeRole` (equivalente conceptual al *Task Role* de ECS).
+- El plano de control EKS opera con el rol IAM `LabEksClusterRole` (equivalente conceptual al *Execution Role* de ECS).
 
----
+## Configuración y secretos en el clúster
+
+| Recurso | Tipo | Contenido |
+| --- | --- | --- |
+| `database-secret` | `Secret` (Kubernetes) | `POSTGRES_PASSWORD`, referenciado por el backend vía `secretKeyRef` |
+| `SPRING_PROFILES_ACTIVE` | Variable de entorno del `Deployment` | `prod` — activa `application-prod.yml` |
+| `DB_URL` / `DB_USERNAME` | Variable de entorno del `Deployment` | Apuntan al Service interno `ep03-database` |
+| `DB_PASSWORD` | `valueFrom.secretKeyRef` | Nunca se define como texto plano en el manifiesto |
+
+Los valores de imagen, réplicas y límites de recursos se generan desde una configuración centralizada (`values.yaml`) en el repositorio de infraestructura del curso, evitando hardcodear parámetros en cada YAML.
 
 ## Notas de seguridad
 
-- Las credenciales por defecto son solo para desarrollo local. En produccion se inyectan como variables de entorno desde el script `deploy-app.sh` via SSM Parameter Store.
-- La aplicacion corre con usuario no-root (`appuser`) dentro del contenedor.
-- CORS esta restringido en produccion al origen configurado en `CORS_ORIGINS`.
-- Spring Security esta habilitado; ajustar `SecurityConfig.java` segun los requerimientos de autenticacion del proyecto.
+- Las credenciales de la base de datos nunca se definen como texto plano: se inyectan desde un `Secret` de Kubernetes.
+- La aplicación corre con usuario no-root (`appuser`) dentro del contenedor.
+- CORS está restringido en producción al origen configurado en `CORS_ORIGINS`.
+- Spring Security está habilitado; ajustar `SecurityConfig.java` según los requerimientos de autenticación del proyecto.
+- Snyk (`--severity-threshold=high --fail-on=all`) bloquea el pipeline si aparecen vulnerabilidades de severidad alta o crítica en las dependencias.
 
 ---
 
 ## CI/CD — GitHub Actions
 
-El pipeline esta definido en `.github/workflows/ci.yml` y se ejecuta automaticamente en cada `push` a cualquier rama. Es el pipeline mas completo del sistema — incluye calidad de codigo, tests con cobertura, analisis de seguridad, versionado semantico, publicacion en ECR y despliegue en AWS, todo en secuencia estricta.
-
-### Trigger
-
-```
-push → cualquier rama (**)
-```
+El pipeline está definido en [`.github/workflows/deploy-backend-eks.yml`](.github/workflows/deploy-backend-eks.yml) y se ejecuta automáticamente en cada `push` a `main` (también soporta `workflow_dispatch` manual). Es el pipeline más completo del sistema: calidad de código, tests con cobertura, seguridad, versionado semántico, publicación en ECR y despliegue en **Amazon EKS**, todo en secuencia estricta.
 
 ### Flujo del pipeline
 
 ```mermaid
 flowchart LR
-    A["code-quality\nOpenRewrite + Spotless + PMD"] -->|ok| B["build-and-test\nTests + cobertura 80%"]
-    B -->|ok| C["security\nSonarCloud + Snyk"]
-    C -->|ok| D["versioning\nTag v1.x.0"]
-    D -->|new_tag| E["build-push-ecr\nJAR + imagen ECR"]
-    E -->|imagen lista| F["deploy\nEC2-App via SSM"]
+    A["code-quality
+OpenRewrite + Spotless + PMD"] -->|ok| B["build-and-test
+JUnit + JaCoCo + Cucumber + Contract"]
+    B -->|ok| C["security
+SonarCloud + Snyk"]
+    C -->|ok| D["versioning
+Tag v1.x.0"]
+    D -->|new_tag| E["build-push-ecr
+JAR + imagen -> ECR"]
+    E -->|imagen lista| F["deploy
+kubectl set image -> EKS"]
 ```
 
 > Si cualquier job falla, el pipeline se detiene y los jobs siguientes no se ejecutan.
 
----
-
 ### Job 0 — Code Quality
-
-Primer guardian del pipeline. Verifica que el codigo cumpla los estandares de calidad antes de ejecutar cualquier test o build.
-
-**Herramientas:**
 
 | Herramienta | Tarea | Falla si... |
 |---|---|---|
-| **OpenRewrite** | Detecta oportunidades de modernizacion (dry-run) | Hay recetas aplicables pendientes |
-| **Spotless** | Verifica formato del codigo fuente | El codigo no cumple el formato definido |
-| **PMD** | Analisis estatico de reglas de calidad | Se violan las reglas del `ruleset.xml` |
-
-**Pasos:**
-1. Checkout del codigo
-2. Configura Java 21 con cache de dependencias Gradle
-3. Ejecuta `rewriteDryRun` — muestra que cambiaria sin modificar archivos
-4. Ejecuta `spotlessCheck` — verifica indentacion, imports y formato
-5. Ejecuta `pmdMain` y `pmdTest` — valida reglas estaticas en codigo principal y tests
-6. Publica el reporte PMD como artefacto (disponible 7 dias)
-
----
+| **OpenRewrite** | Detecta oportunidades de modernización (dry-run) | Hay recetas aplicables pendientes |
+| **Spotless** | Verifica formato del código fuente | El código no cumple el formato definido |
+| **PMD** | Análisis estático de reglas de calidad | Se violan las reglas del `ruleset.xml` |
 
 ### Job 1 — Build & Test
 
-Compila el proyecto y ejecuta la suite completa de tests, verificando que la cobertura supere el umbral minimo del **80%**.
-
-**Suite de tests incluida:**
-- Tests unitarios (JUnit 5)
-- Tests de integracion con H2 en memoria
-- Tests de aceptacion BDD (Cucumber)
-- Tests de contrato (Spring Cloud Contract)
-- Verificacion de cobertura JaCoCo (instrucciones y ramas ≥ 80%)
-
-**Pasos:**
-1. Checkout con historial completo (`fetch-depth: 0`) para SonarCloud
-2. Configura Java 21 con cache Gradle
-3. Ejecuta `clean check jacocoTestReport` — compila, tests y cobertura en un solo comando
-4. Si la cobertura es menor al 80%, el build falla aqui y el pipeline se detiene
-5. Publica reportes JaCoCo (HTML + XML) y resultados de tests como artefactos
-
-**Artefactos generados:**
-
-| Artefacto | Contenido | Retencion |
-|---|---|---|
-| `jacoco-coverage-report` | Reporte HTML + XML de cobertura | 7 dias |
-| `test-results` | Resultados XML de JUnit | 7 dias |
-
----
+Compila el proyecto y ejecuta la suite completa de tests (JUnit, JaCoCo, Cucumber BDD, Spring Cloud Contract). Publica reportes de tests, cobertura y contratos como artefactos.
 
 ### Job 2 — Security Analysis
 
-Analisis de seguridad en dos frentes: calidad del codigo con SonarCloud y vulnerabilidades en dependencias con Snyk.
-
-#### SonarCloud
-
-Analiza el codigo fuente contra las reglas del Quality Gate configurado en SonarCloud, usando el reporte de cobertura generado en el job anterior.
-
-- Descarga el artefacto `jacoco-coverage-report` del job anterior
-- Ejecuta `./gradlew sonar` con el token de autenticacion
-- `qualitygate.wait=false` — no bloquea el pipeline esperando el resultado del Quality Gate (el analisis corre en paralelo en SonarCloud)
-
-#### Snyk SCA (Software Composition Analysis)
-
-Escanea las dependencias del proyecto en busca de vulnerabilidades conocidas (CVEs).
-
-- Instala Snyk CLI en el runner
-- Ejecuta `snyk test` con umbral `--severity-threshold=high` — falla solo si hay vulnerabilidades de severidad alta o critica
-- Filtra configuraciones relevantes: `compile`, `runtime`, `default`
-- Genera un reporte en formato SARIF para integracion con herramientas de seguridad
-- El reporte SARIF se publica como artefacto aunque el job falle (`if: always()`)
-
-**Artefactos generados:**
-
-| Artefacto | Contenido | Retencion |
-|---|---|---|
-| `snyk-security-report` | Reporte SARIF de vulnerabilidades | 7 dias |
-
----
+- **SonarCloud**: análisis estático de calidad con Automatic Analysis activo en el proyecto.
+- **Snyk SCA**: escanea dependencias (`build.gradle`) con `--severity-threshold=high --fail-on=all`; genera además un reporte SARIF.
 
 ### Job 3 — Versioning
 
-Calcula automaticamente la siguiente version semantica con esquema `v1.x.0` y crea el tag en el repositorio. Solo se ejecuta si los tres jobs anteriores pasaron exitosamente.
-
-**Logica de calculo:**
-- Busca el ultimo tag existente con patron `v1.*`
-- Si no existe ningun tag, inicia en `v1.0.0`
-- Si existe, incrementa el numero menor: `v1.3.0` → `v1.4.0`
-- Crea y publica el tag con `github-actions[bot]`
-
-**Output:** `new_tag` — propagado a los jobs siguientes como identificador de version.
-
----
+Calcula automáticamente la siguiente versión semántica (`v1.x.0`): busca el último tag `v1.*`, incrementa el número menor (o inicia en `v1.0.0` si no existe ninguno) y publica el tag con `github-actions[bot]`.
 
 ### Job 4 — Build & Push ECR
 
-Genera el JAR de produccion y construye la imagen Docker final, publicandola en Amazon ECR con dos tags simultaneos.
-
-**Diferencia con el Job 1:** aqui se compila **sin tests** (`-x test`) porque ya fueron validados. El objetivo es generar el artefacto de produccion lo mas rapido posible.
-
-**Pasos:**
-1. Genera el JAR con `bootJar -x test`
-2. Configura credenciales AWS desde los secrets del repositorio
-3. Autentica en Amazon ECR
-4. Construye la imagen con Docker Buildx
-5. Publica con dos tags:
-   - `v1.x.0` — version inmutable para trazabilidad y rollback
-   - `latest` — apuntando siempre a la version mas reciente
-
-**Cache:** utiliza GitHub Actions Cache (`type=gha`) para reutilizar capas Docker entre ejecuciones.
+Genera el JAR de producción (`bootJar -x test`, sin repetir tests ya validados), construye la imagen con Docker Buildx y la publica en Amazon ECR con dos tags:
 
 | Tag publicado | Ejemplo | Uso |
 |---|---|---|
-| Version semantica | `ep03-backend:v1.4.0` | Rollback, trazabilidad |
-| Latest | `ep03-backend:latest` | Despliegue automatico |
+| Versión semántica | `ep03-backend:v1.4.0` | Trazabilidad histórica |
+| `latest` | `ep03-backend:latest` | Tag usado por el paso de despliegue |
 
----
+Usa GitHub Actions Cache (`type=gha`) para reutilizar capas entre builds.
 
-### Job 5 — Deploy via SSM
+### Job 5 — Deploy a EKS
 
-Despliega la nueva imagen en la instancia `EC2-App` sin necesidad de acceso SSH directo. La instancia esta en una subnet privada sin acceso a internet — la comunicacion se realiza exclusivamente a traves de **VPC Endpoints de SSM**.
+1. Configura credenciales AWS temporales (Learner Lab) con `aws-actions/configure-aws-credentials`.
+2. Autentica contra ECR y genera el `kubeconfig` con `aws eks update-kubeconfig --name laboratorio-ep03-eks`.
+3. Valida acceso al clúster (`kubectl get nodes`).
+4. Actualiza la imagen del `Deployment`: `kubectl set image deployment/ep03-backend backend=<ECR>/ep03-backend:<tag> -n ep03`.
+5. Espera el rollout con `kubectl rollout status --timeout=600s`; si falla o excede el tiempo, imprime automáticamente `describe` y `logs` del deployment/pods para diagnóstico.
+6. Verifica el estado final: pods, `Service` y `HorizontalPodAutoscaler`.
 
-**Pasos:**
-1. Obtiene el Instance ID de `EC2-App` desde **SSM Parameter Store** (`/ep03/ec2/app`)
-2. Envia el comando `deploy-app.sh` a la instancia via `AWS-RunShellScript`
-3. Hace polling del estado del comando cada 10 segundos (maximo 5 minutos / 30 intentos)
-4. Si el comando termina en `Success`, imprime el output y el job finaliza exitosamente
-5. Si termina en `Failed`, `TimedOut` o `Cancelled`, imprime el error y el job falla
+### Secrets requeridos (GitHub Secrets)
 
-**Comportamiento del deploy en EC2-App:**
-- Lee la IP privada de `EC2-Datos` desde SSM Parameter Store (`/ep03/ec2/datos/private-ip`)
-- Lee la IP publica de `EC2-Web` desde SSM Parameter Store (`/ep03/ec2/web/public-ip`)
-- Hace pull de `ep03-backend:latest` desde ECR via VPC Endpoint
-- Detiene y elimina el contenedor anterior
-- Levanta el nuevo contenedor con `DB_URL`, `CORS_ORIGINS` y credenciales configuradas
+| Secret | Descripción |
+| ------ | ----------- |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Credenciales temporales del AWS Academy Learner Lab |
+| `AWS_REGION` | `us-east-1` |
+| `EKS_CLUSTER_NAME` | `laboratorio-ep03-eks` — el job aborta con error explícito si falta |
+| `SONAR_TOKEN` | Autenticación contra SonarCloud |
+| `SNYK_TOKEN` | Autenticación contra Snyk |
 
----
+### Permisos del workflow
 
-### Secrets requeridos
-
-| Secret | Jobs que lo usan | Descripcion |
-| ------ | ---------------- | ----------- |
-| `AWS_ACCESS_KEY_ID` | security, versioning, build-push-ecr, deploy | Credencial de acceso AWS |
-| `AWS_SECRET_ACCESS_KEY` | security, versioning, build-push-ecr, deploy | Clave secreta AWS |
-| `AWS_SESSION_TOKEN` | security, versioning, build-push-ecr, deploy | Token de sesion AWS (Lab Academy) |
-| `AWS_REGION` | security, versioning, build-push-ecr, deploy | Region AWS (`us-east-1`) |
-| `SONAR_TOKEN` | security | Token de autenticacion SonarCloud |
-| `SNYK_TOKEN` | security | Token de autenticacion Snyk |
-
-### Permisos
-
-| Permiso | Nivel | Razon |
+| Permiso | Nivel | Razón |
 | ------- | ----- | ----- |
 | `contents: write` | Repositorio | Crear y publicar tags git |
-
-### Resumen de ejecucion
-
-Al finalizar cada job relevante, el pipeline publica un resumen en la interfaz de GitHub Actions con la version desplegada, el registry ECR utilizado y el ID de la instancia EC2.
